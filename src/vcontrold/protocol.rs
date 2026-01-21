@@ -95,6 +95,7 @@ pub fn format_quit() -> String {
 }
 
 /// Check if a buffer contains the prompt
+#[allow(dead_code)]
 pub fn has_prompt(buffer: &str) -> bool {
     buffer.contains(PROMPT)
 }

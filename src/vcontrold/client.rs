@@ -3,7 +3,7 @@
 //! Manages a persistent TCP connection to vcontrold, with automatic reconnection.
 
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use crate::error::VcontroldError;
 
 use super::protocol::{
-    extract_response, format_command, format_quit, has_prompt, parse_response, validate_command,
-    CommandResult,
+    extract_response, format_command, format_quit, parse_response, validate_command,
+    CommandResult, PROMPT,
 };
 
 /// Default vcontrold port
@@ -75,28 +75,16 @@ impl VcontroldClient {
         let (read_half, write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
 
-        // Wait for initial prompt
+        // Wait for initial prompt (no newline, so read byte by byte)
         let mut buffer = String::new();
-        loop {
-            let read_result = timeout(READ_TIMEOUT, reader.read_line(&mut buffer)).await;
+        let result = timeout(READ_TIMEOUT, read_until_prompt(&mut reader, &mut buffer)).await;
 
-            match read_result {
-                Ok(Ok(0)) => {
-                    return Err(VcontroldError::ConnectionFailed(
-                        "connection closed".to_string(),
-                    ))
-                }
-                Ok(Ok(_)) => {
-                    if has_prompt(&buffer) {
-                        debug!("Received initial prompt from vcontrold");
-                        break;
-                    }
-                }
-                Ok(Err(e)) => return Err(VcontroldError::Io(e)),
-                Err(_) => {
-                    return Err(VcontroldError::Timeout);
-                }
+        match result {
+            Ok(Ok(())) => {
+                debug!("Received initial prompt from vcontrold");
             }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(VcontroldError::Timeout),
         }
 
         Ok(Connection {
@@ -129,29 +117,22 @@ impl VcontroldClient {
 
         // Read response until prompt
         let mut buffer = String::new();
-        loop {
-            let read_result = timeout(READ_TIMEOUT, conn.reader.read_line(&mut buffer)).await;
+        let read_result = timeout(READ_TIMEOUT, read_until_prompt(&mut conn.reader, &mut buffer)).await;
 
-            match read_result {
-                Ok(Ok(0)) => {
-                    // Connection closed, mark as disconnected
-                    drop(conn_guard);
-                    *self.connection.lock().await = None;
-                    return Err(VcontroldError::ConnectionLost);
-                }
-                Ok(Ok(_)) => {
-                    if has_prompt(&buffer) {
-                        break;
-                    }
-                }
-                Ok(Err(e)) => {
-                    drop(conn_guard);
-                    *self.connection.lock().await = None;
-                    return Err(VcontroldError::Io(e));
-                }
-                Err(_) => {
-                    return Err(VcontroldError::Timeout);
-                }
+        match read_result {
+            Ok(Ok(())) => {}
+            Ok(Err(VcontroldError::ConnectionLost)) => {
+                drop(conn_guard);
+                *self.connection.lock().await = None;
+                return Err(VcontroldError::ConnectionLost);
+            }
+            Ok(Err(e)) => {
+                drop(conn_guard);
+                *self.connection.lock().await = None;
+                return Err(e);
+            }
+            Err(_) => {
+                return Err(VcontroldError::Timeout);
             }
         }
 
@@ -198,6 +179,29 @@ impl VcontroldClient {
         let mut conn_guard = self.connection.lock().await;
         if conn_guard.take().is_some() {
             warn!("Connection marked as disconnected");
+        }
+    }
+}
+
+/// Read from reader until the prompt is found
+async fn read_until_prompt<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    buffer: &mut String,
+) -> Result<(), VcontroldError> {
+    let mut byte_buf = [0u8; 1];
+    loop {
+        match reader.read(&mut byte_buf).await {
+            Ok(0) => return Err(VcontroldError::ConnectionLost),
+            Ok(_) => {
+                // Safe because vcontrold uses ASCII
+                if let Ok(c) = std::str::from_utf8(&byte_buf) {
+                    buffer.push_str(c);
+                    if buffer.ends_with(PROMPT) {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => return Err(VcontroldError::Io(e)),
         }
     }
 }

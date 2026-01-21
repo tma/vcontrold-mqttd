@@ -50,6 +50,25 @@ async fn main() {
     }
 }
 
+/// Wait for shutdown signal (SIGTERM or SIGINT)
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => info!("Received SIGTERM"),
+            _ = sigint.recv() => info!("Received SIGINT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+        info!("Received Ctrl+C");
+    }
+}
+
 async fn run() -> Result<()> {
     // Load configuration
     let config = Config::from_env()?;
@@ -151,8 +170,7 @@ async fn run() -> Result<()> {
             error!("Subscriber exited unexpectedly");
             None
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received shutdown signal");
+        _ = shutdown_signal() => {
             None
         }
     };

@@ -1,0 +1,28 @@
+{
+  "name": "vcontrold-mqttd",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  },
+  "postCreateCommand": "cargo fetch",
+  "postStartCommand": "mosquitto -c /etc/mosquitto/mosquitto.conf -d || true",
+  "remoteUser": "vscode",
+  "mounts": [
+    "source=${localWorkspaceFolder}/config,target=/config,type=bind,consistency=cached"
+  ],
+  "forwardPorts": [1883, 3002]
+}

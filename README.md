@@ -11,9 +11,17 @@ A Rust-based MQTT bridge for [vcontrold](https://github.com/openv/vcontrold) (Vi
 - **Periodic polling** of heating controller parameters
 - **Request/response bridge** for ad-hoc commands via MQTT
 - **Command batching** to respect protocol limits
-- **Multi-architecture** Docker images (amd64, arm64, armhf)
+- **Multi-architecture** Docker images (amd64, arm64)
 
 ## Quick Start
+
+Pull from GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/tma/vcontrold-mqttd:latest
+```
+
+Or build locally:
 
 ```bash
 docker build -t vcontrold-mqttd:latest .
@@ -24,7 +32,7 @@ Create a `docker-compose.yml`:
 ```yaml
 services:
   vcontrold-mqttd:
-    image: vcontrold-mqttd:latest
+    image: ghcr.io/tma/vcontrold-mqttd:latest
     restart: unless-stopped
     devices:
       - /dev/ttyUSB0:/dev/vitocal

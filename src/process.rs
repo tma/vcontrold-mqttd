@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::error::ProcessError;
 use crate::vcontrold::VcontroldClient;
@@ -115,7 +115,6 @@ impl VcontroldProcess {
     }
 
     /// Kill the process
-    #[allow(dead_code)]
     pub async fn kill(&mut self) {
         if let Err(e) = self.child.kill().await {
             warn!("Failed to kill vcontrold: {}", e);
@@ -126,19 +125,5 @@ impl VcontroldProcess {
     #[allow(dead_code)]
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
-    }
-}
-
-/// Monitor task that watches vcontrold and signals if it exits
-pub async fn monitor_process(mut process: VcontroldProcess) -> ProcessError {
-    match process.wait().await {
-        Ok(code) => {
-            error!("vcontrold exited with code: {:?}", code);
-            ProcessError::UnexpectedExit(code)
-        }
-        Err(e) => {
-            error!("Error waiting for vcontrold: {}", e);
-            e
-        }
     }
 }

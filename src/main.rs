@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::mqtt::{run_event_loop, run_subscriber, MqttClient};
 use crate::polling::run_polling_loop;
-use crate::process::{monitor_process, VcontroldProcess};
+use crate::process::VcontroldProcess;
 use crate::vcontrold::VcontroldClient;
 
 #[tokio::main]
@@ -59,7 +59,7 @@ async fn run() -> Result<()> {
     }
 
     // Start vcontrold process
-    let vcontrold_process = VcontroldProcess::spawn(None, config.debug).await?;
+    let mut vcontrold_process = VcontroldProcess::spawn(None, config.debug).await?;
 
     // Wait for vcontrold to be ready
     vcontrold_process.wait_ready().await?;
@@ -109,26 +109,25 @@ async fn run() -> Result<()> {
         None
     };
 
-    // Monitor vcontrold process
-    let process_handle = tokio::spawn(monitor_process(vcontrold_process));
-
     info!("vcontrold-mqttd started");
 
-    // Wait for any task to complete (which means something went wrong)
-    tokio::select! {
-        result = process_handle => {
+    // Wait for any task to complete or shutdown signal
+    let exit_error = tokio::select! {
+        result = vcontrold_process.wait() => {
             match result {
-                Ok(err) => {
-                    error!("vcontrold process exited: {}", err);
-                    return Err(Error::Process(err));
+                Ok(code) => {
+                    error!("vcontrold exited with code: {:?}", code);
+                    Some(Error::Process(crate::error::ProcessError::UnexpectedExit(code)))
                 }
                 Err(e) => {
-                    error!("Process monitor task failed: {}", e);
+                    error!("Error waiting for vcontrold: {}", e);
+                    Some(Error::Process(e))
                 }
             }
         }
         _ = eventloop_handle => {
             error!("MQTT event loop exited unexpectedly");
+            None
         }
         _ = async {
             if let Some(handle) = polling_handle {
@@ -139,6 +138,7 @@ async fn run() -> Result<()> {
             }
         } => {
             error!("Polling loop exited unexpectedly");
+            None
         }
         _ = async {
             if let Some(handle) = subscriber_handle {
@@ -149,14 +149,24 @@ async fn run() -> Result<()> {
             }
         } => {
             error!("Subscriber exited unexpectedly");
+            None
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received shutdown signal");
+            None
         }
-    }
+    };
 
-    // Cleanup
+    // Cleanup: kill vcontrold process
+    info!("Shutting down vcontrold...");
+    vcontrold_process.kill().await;
+
+    // Disconnect TCP client
     vcontrold_client.disconnect().await;
+
+    if let Some(e) = exit_error {
+        return Err(e);
+    }
 
     Ok(())
 }

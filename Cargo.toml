@@ -3,7 +3,7 @@ name = "vcontrold-mqttd"
 version = "0.1.0"
 edition = "2021"
 description = "MQTT bridge for vcontrold (Viessmann heating controller)"
-license = "GPL-3.0"
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full", "process", "signal"] }

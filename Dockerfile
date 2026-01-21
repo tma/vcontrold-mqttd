@@ -29,18 +29,11 @@ FROM rust:bookworm AS rust-builder
 
 WORKDIR /build
 
-# Copy manifests first for better caching
+# Copy source code
 COPY Cargo.toml Cargo.lock* ./
-
-# Create a dummy main.rs to build dependencies
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release || true
-RUN rm -rf src
-
-# Copy actual source code
 COPY src ./src
 
-# Build the actual binary
+# Build the binary
 RUN cargo build --release
 
 # Stage 3: Final image

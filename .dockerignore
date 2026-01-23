@@ -1,0 +1,46 @@
+# Build artifacts
+target/
+debug/
+*.pdb
+
+# Rust backup files
+**/*.rs.bk
+
+# Cargo mutation testing
+**/mutants.out*/
+
+# Git
+.git/
+.gitignore
+
+# GitHub
+.github/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Development container
+.devcontainer/
+
+# Documentation (not needed in image)
+*.md
+!README.md
+LICENSE
+AGENTS.md
+
+# Example and test configs
+config/
+
+# Local environment files
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+logs/

@@ -122,11 +122,15 @@ impl VcontroldClient {
         match read_result {
             Ok(Ok(())) => {}
             Ok(Err(VcontroldError::ConnectionLost)) => {
+                // Stream is dead, nothing to send quit to
                 drop(conn_guard);
                 *self.connection.lock().await = None;
                 return Err(VcontroldError::ConnectionLost);
             }
             Ok(Err(e)) => {
+                // Try to send quit so vcontrold doesn't see a broken pipe
+                let _ = conn.writer.write_all(format_quit().as_bytes()).await;
+                let _ = conn.writer.flush().await;
                 drop(conn_guard);
                 *self.connection.lock().await = None;
                 return Err(e);
@@ -134,7 +138,9 @@ impl VcontroldClient {
             Err(_) => {
                 // Clear stale connection: the stream may contain partial
                 // data from the timed-out response, so reusing it would
-                // corrupt subsequent commands.
+                // corrupt subsequent commands. Best-effort quit.
+                let _ = conn.writer.write_all(format_quit().as_bytes()).await;
+                let _ = conn.writer.flush().await;
                 drop(conn_guard);
                 *self.connection.lock().await = None;
                 return Err(VcontroldError::Timeout);

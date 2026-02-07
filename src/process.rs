@@ -109,7 +109,7 @@ impl VcontroldProcess {
             .child
             .wait()
             .await
-            .map_err(|e| ProcessError::StartFailed(e.to_string()))?;
+            .map_err(|e| ProcessError::WaitFailed(e.to_string()))?;
 
         Ok(status.code())
     }

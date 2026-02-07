@@ -64,6 +64,9 @@ pub enum ProcessError {
     #[error("vcontrold failed to start: {0}")]
     StartFailed(String),
 
+    #[error("failed waiting for vcontrold process: {0}")]
+    WaitFailed(String),
+
     #[error("vcontrold exited unexpectedly with code {0:?}")]
     UnexpectedExit(Option<i32>),
 

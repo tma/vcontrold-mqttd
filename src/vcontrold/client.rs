@@ -132,6 +132,11 @@ impl VcontroldClient {
                 return Err(e);
             }
             Err(_) => {
+                // Clear stale connection: the stream may contain partial
+                // data from the timed-out response, so reusing it would
+                // corrupt subsequent commands.
+                drop(conn_guard);
+                *self.connection.lock().await = None;
                 return Err(VcontroldError::Timeout);
             }
         }

@@ -80,7 +80,6 @@ impl MqttClient {
     }
 
     /// Publish a message without retain flag
-    #[allow(dead_code)]
     pub async fn publish(&self, topic: &str, payload: &str) -> Result<(), MqttError> {
         debug!("Publishing to {}: {}", topic, payload);
         self.client

@@ -111,8 +111,9 @@ pub async fn run_subscriber(
         let json_response = build_json_response(&successful_results);
         debug!("Sending response: {}", json_response);
 
-        // Publish response (retained)
-        if let Err(e) = mqtt_client.publish_retained(&response_topic, &json_response).await {
+        // Publish response (not retained: this is a point-in-time response
+        // to a specific request, not a persistent state value)
+        if let Err(e) = mqtt_client.publish(&response_topic, &json_response).await {
             error!("Failed to publish response: {}", e);
         }
     }

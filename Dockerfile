@@ -24,59 +24,7 @@ RUN set -eux; \
     wget -O /vcontrold.deb \
     "https://github.com/openv/vcontrold/releases/download/v${VCONTROLD_VERSION}/vcontrold_${VCONTROLD_VERSION}-${VCONTROLD_DEB_REVISION}_${DEB_ARCH}.deb"
 
-# Stage 2: Build Rust binary with cross-compilation
-FROM rust:bookworm AS rust-builder
-
-ARG TARGETARCH
-ARG TARGETVARIANT
-
-WORKDIR /build
-
-# Install cross-compilation toolchains
-RUN set -eux; \
-    case "${TARGETARCH}${TARGETVARIANT:+-${TARGETVARIANT}}" in \
-    "amd64") \
-        RUST_TARGET="x86_64-unknown-linux-gnu" \
-        ;; \
-    "arm64") \
-        RUST_TARGET="aarch64-unknown-linux-gnu" \
-        && apt-get update \
-        && apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-        && rm -rf /var/lib/apt/lists/* \
-        ;; \
-    "arm-v7") \
-        RUST_TARGET="armv7-unknown-linux-gnueabihf" \
-        && apt-get update \
-        && apt-get install -y --no-install-recommends \
-            gcc-arm-linux-gnueabihf \
-            libc6-dev-armhf-cross \
-        && rm -rf /var/lib/apt/lists/* \
-        ;; \
-    *) echo "Unsupported arch: ${TARGETARCH}${TARGETVARIANT:+-${TARGETVARIANT}}"; exit 1 ;; \
-    esac; \
-    rustup target add ${RUST_TARGET}; \
-    echo "[target.aarch64-unknown-linux-gnu]" >> /usr/local/cargo/config.toml; \
-    echo 'linker = "aarch64-linux-gnu-gcc"' >> /usr/local/cargo/config.toml; \
-    echo "[target.armv7-unknown-linux-gnueabihf]" >> /usr/local/cargo/config.toml; \
-    echo 'linker = "arm-linux-gnueabihf-gcc"' >> /usr/local/cargo/config.toml
-
-# Copy source code
-COPY Cargo.toml Cargo.lock* ./
-COPY src ./src
-
-# Build for target architecture
-RUN set -eux; \
-    case "${TARGETARCH}${TARGETVARIANT:+-${TARGETVARIANT}}" in \
-    "amd64") RUST_TARGET="x86_64-unknown-linux-gnu" ;; \
-    "arm64") RUST_TARGET="aarch64-unknown-linux-gnu" ;; \
-    "arm-v7") RUST_TARGET="armv7-unknown-linux-gnueabihf" ;; \
-    esac; \
-    cargo build --release --target ${RUST_TARGET}; \
-    cp /build/target/${RUST_TARGET}/release/vcontrold-mqttd /build/vcontrold-mqttd
-
-# Stage 3: Final image
+# Stage 2: Final image
 FROM debian:bookworm-slim
 
 # Copy vcontrold from downloader stage
@@ -99,8 +47,8 @@ RUN groupadd -r vcontrold \
     && mkdir -p /config \
     && chown -R vcontrold:vcontrold /config
 
-# Copy the Rust binary
-COPY --from=rust-builder /build/vcontrold-mqttd /usr/local/bin/vcontrold-mqttd
+# Copy the pre-built Rust binary from build context
+COPY vcontrold-mqttd /usr/local/bin/vcontrold-mqttd
 
 USER vcontrold
 

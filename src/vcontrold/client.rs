@@ -195,21 +195,26 @@ impl VcontroldClient {
 }
 
 /// Read from reader until the prompt is found
+///
+/// Accumulates raw bytes and checks for the prompt in the byte stream.
+/// Once found, the buffer is converted to a (lossy) UTF-8 string.
+/// This avoids silently dropping non-ASCII bytes (e.g. `°` in unit
+/// strings) that would break prompt detection.
 async fn read_until_prompt<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     buffer: &mut String,
 ) -> Result<(), VcontroldError> {
+    let prompt_bytes = PROMPT.as_bytes();
+    let mut raw = Vec::new();
     let mut byte_buf = [0u8; 1];
     loop {
         match reader.read(&mut byte_buf).await {
             Ok(0) => return Err(VcontroldError::ConnectionLost),
             Ok(_) => {
-                // Safe because vcontrold uses ASCII
-                if let Ok(c) = std::str::from_utf8(&byte_buf) {
-                    buffer.push_str(c);
-                    if buffer.ends_with(PROMPT) {
-                        return Ok(());
-                    }
+                raw.push(byte_buf[0]);
+                if raw.ends_with(prompt_bytes) {
+                    *buffer = String::from_utf8_lossy(&raw).into_owned();
+                    return Ok(());
                 }
             }
             Err(e) => return Err(VcontroldError::Io(e)),

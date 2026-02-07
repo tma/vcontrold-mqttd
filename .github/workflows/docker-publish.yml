@@ -37,38 +37,35 @@ jobs:
   build-binary:
     needs: test
     runs-on: ubuntu-latest
+    container: rust:bookworm
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
             rust-target: x86_64-unknown-linux-gnu
-            linker: gcc
           - arch: arm64
             rust-target: aarch64-unknown-linux-gnu
-            linker: gcc-aarch64-linux-gnu
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust-target }}
-
       - name: Install cross-compilation toolchain
         if: matrix.arch == 'arm64'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          apt-get update
+          apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.rust-target }}
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
             target
           key: cargo-build-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-build-${{ matrix.arch }}-

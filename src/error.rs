@@ -53,9 +53,6 @@ pub enum MqttError {
     #[error("publish failed: {0}")]
     PublishFailed(String),
 
-    #[error("subscribe failed: {0}")]
-    SubscribeFailed(String),
-
     #[error("client error: {0}")]
     #[allow(dead_code)]
     Client(String),

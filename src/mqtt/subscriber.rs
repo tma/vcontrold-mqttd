@@ -63,19 +63,13 @@ impl Subscriber {
 /// Listens for incoming MQTT messages, executes commands on vcontrold,
 /// and publishes responses.
 pub async fn run_subscriber(
+    subscriber: Subscriber,
     mqtt_client: Arc<MqttClient>,
     vcontrold: Arc<VcontroldClient>,
     mut message_rx: mpsc::Receiver<IncomingMessage>,
 ) {
-    let subscriber = Subscriber::new(mqtt_client.base_topic());
     let request_topic = subscriber.request_topic();
     let response_topic = subscriber.response_topic();
-
-    // Subscribe to request topic
-    if let Err(e) = mqtt_client.subscribe(&request_topic).await {
-        error!("Failed to subscribe to {}: {}", request_topic, e);
-        return;
-    }
 
     info!("Subscriber ready, listening on {}", request_topic);
 

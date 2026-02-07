@@ -20,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::mqtt::{run_event_loop, run_subscriber, MqttClient};
+use crate::mqtt::{run_event_loop, run_subscriber, MqttClient, Subscriber};
 use crate::polling::run_polling_loop;
 use crate::process::VcontroldProcess;
 use crate::vcontrold::VcontroldClient;
@@ -99,8 +99,22 @@ async fn run() -> Result<()> {
         (None, None)
     };
 
+    // Build subscriber and subscription topics (if enabled)
+    let (subscriber, subscribe_topics) = if config.mqtt_subscribe {
+        let sub = Subscriber::new(mqtt_client.base_topic());
+        let topics = vec![sub.request_topic()];
+        (Some(sub), topics)
+    } else {
+        (None, vec![])
+    };
+
     // Spawn MQTT event loop
-    let eventloop_handle = tokio::spawn(run_event_loop(eventloop, message_tx));
+    let eventloop_handle = tokio::spawn(run_event_loop(
+        eventloop,
+        mqtt_client.clone_client(),
+        subscribe_topics,
+        message_tx,
+    ));
 
     // Spawn polling loop (if commands are configured)
     let polling_handle = if !config.commands.is_empty() {
@@ -116,13 +130,13 @@ async fn run() -> Result<()> {
     };
 
     // Spawn subscriber (if enabled)
-    let subscriber_handle = if config.mqtt_subscribe {
+    let subscriber_handle = if let Some(sub) = subscriber {
         let mqtt_clone = Arc::clone(&mqtt_client);
         let vcontrold_clone = Arc::clone(&vcontrold_client);
         let rx = message_rx.unwrap();
         info!("Request/response bridge enabled");
         Some(tokio::spawn(async move {
-            run_subscriber(mqtt_clone, vcontrold_clone, rx).await;
+            run_subscriber(sub, mqtt_clone, vcontrold_clone, rx).await;
         }))
     } else {
         None

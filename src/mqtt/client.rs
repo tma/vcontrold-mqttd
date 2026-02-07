@@ -89,17 +89,7 @@ impl MqttClient {
             .map_err(|e| MqttError::PublishFailed(e.to_string()))
     }
 
-    /// Subscribe to a topic
-    pub async fn subscribe(&self, topic: &str) -> Result<(), MqttError> {
-        info!("Subscribing to {}", topic);
-        self.client
-            .subscribe(topic, QoS::AtLeastOnce)
-            .await
-            .map_err(|e| MqttError::SubscribeFailed(e.to_string()))
-    }
-
     /// Get a clone of the underlying client (for use in multiple tasks)
-    #[allow(dead_code)]
     pub fn clone_client(&self) -> AsyncClient {
         self.client.clone()
     }
@@ -271,8 +261,14 @@ impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
 }
 
 /// Run the MQTT event loop and forward incoming messages
+///
+/// Re-subscribes to all topics on every ConnAck (reconnection), since
+/// rumqttc uses `clean_start = true` by default and the broker discards
+/// session state (including subscriptions) when the client reconnects.
 pub async fn run_event_loop(
     mut eventloop: EventLoop,
+    client: AsyncClient,
+    subscribe_topics: Vec<String>,
     message_tx: Option<mpsc::Sender<IncomingMessage>>,
 ) {
     loop {
@@ -294,6 +290,14 @@ pub async fn run_event_loop(
                         }
                         rumqttc::v5::Incoming::ConnAck(_) => {
                             info!("Connected to MQTT broker");
+
+                            // Re-subscribe to all topics on every (re)connection
+                            for topic in &subscribe_topics {
+                                info!("Subscribing to {}", topic);
+                                if let Err(e) = client.subscribe(topic, QoS::AtLeastOnce).await {
+                                    error!("Failed to subscribe to {}: {}", topic, e);
+                                }
+                            }
                         }
                         rumqttc::v5::Incoming::SubAck(_) => {
                             debug!("Subscription acknowledged");

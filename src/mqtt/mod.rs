@@ -6,4 +6,4 @@ mod subscriber;
 
 pub use client::{run_event_loop, MqttClient};
 pub use publisher::Publisher;
-pub use subscriber::run_subscriber;
+pub use subscriber::{run_subscriber, Subscriber};

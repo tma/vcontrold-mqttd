@@ -170,7 +170,13 @@ impl VcontroldClient {
     pub async fn is_ready(&self) -> bool {
         // Try to connect and receive initial prompt
         match self.connect_internal().await {
-            Ok(_) => true,
+            Ok(mut conn) => {
+                // Gracefully disconnect so vcontrold doesn't accumulate
+                // abandoned connections during the readiness probe loop.
+                let _ = conn.writer.write_all(format_quit().as_bytes()).await;
+                let _ = conn.writer.flush().await;
+                true
+            }
             Err(e) => {
                 debug!("Readiness check failed: {}", e);
                 false

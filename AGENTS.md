@@ -146,15 +146,15 @@ Requires a running vcontrold instance or mock server. The devcontainer includes:
 
 Key crates:
 - `tokio` - Async runtime
-- `rumqttc` - MQTT v5 client (with rustls TLS)
-- `rustls` v0.22 - TLS implementation (must match rumqttc's version)
+- `rumqttc` - MQTT v5 client (with rustls TLS via tokio-rustls)
+- `rustls` v0.23 - TLS implementation (used directly for `ClientConfig` building; must be compatible with tokio-rustls version used by rumqttc)
 - `serde`/`serde_json` - JSON serialization
 - `tracing` - Structured logging
 - `thiserror` - Error type derivation
 
 ## Gotchas
 
-1. **rustls version**: rumqttc 0.24 uses rustls 0.22, not 0.23. Version mismatch causes compile errors.
+1. **rustls version**: rumqttc 0.25 uses tokio-rustls 0.26, which depends on rustls 0.23. The direct `rustls` dependency in Cargo.toml (used for building `ClientConfig` in `mqtt/client.rs`) must resolve to the same major version.
 
 2. **Transport enum**: `rumqttc::Transport` is at crate root, not in `rumqttc::v5`.
 

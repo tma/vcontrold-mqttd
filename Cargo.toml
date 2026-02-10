@@ -18,6 +18,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 hostname = "0.4"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 lto = true
 strip = true

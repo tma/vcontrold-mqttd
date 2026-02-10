@@ -13,6 +13,7 @@ mod polling;
 mod process;
 mod vcontrold;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -91,6 +92,10 @@ async fn run() -> Result<()> {
     let (mqtt_client, eventloop) = MqttClient::new(&config.mqtt, &publisher_client_id)?;
     let mqtt_client = Arc::new(mqtt_client);
 
+    // Shared flag: tracks whether the MQTT broker is currently reachable.
+    // Written by run_event_loop, read by run_polling_loop.
+    let mqtt_connected = Arc::new(AtomicBool::new(false));
+
     // Channel for subscriber messages (if enabled)
     let (message_tx, message_rx) = if config.mqtt_subscribe {
         let (tx, rx) = mpsc::channel(100);
@@ -114,6 +119,7 @@ async fn run() -> Result<()> {
         mqtt_client.clone_client(),
         subscribe_topics,
         message_tx,
+        Arc::clone(&mqtt_connected),
     ));
 
     // Spawn polling loop (if commands are configured)
@@ -121,8 +127,9 @@ async fn run() -> Result<()> {
         let config_clone = config.clone();
         let vcontrold_clone = Arc::clone(&vcontrold_client);
         let mqtt_clone = Arc::clone(&mqtt_client);
+        let connected = Arc::clone(&mqtt_connected);
         Some(tokio::spawn(async move {
-            run_polling_loop(&config_clone, vcontrold_clone, mqtt_clone).await;
+            run_polling_loop(&config_clone, vcontrold_clone, mqtt_clone, connected).await;
         }))
     } else {
         info!("No commands configured, polling disabled");

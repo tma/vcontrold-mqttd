@@ -2,10 +2,19 @@
 //!
 //! Publishes vcontrold command results to MQTT topics.
 
+use std::time::Duration;
+
+use tokio::time::timeout;
 use tracing::{debug, error, warn};
 
 use crate::error::MqttError;
 use crate::vcontrold::{CommandResult, Value};
+
+/// Timeout for individual MQTT publish operations.
+///
+/// Prevents the polling loop from blocking indefinitely when the MQTT
+/// client's internal channel is full (e.g. during a broker outage).
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 use super::client::MqttClient;
 
@@ -48,7 +57,17 @@ impl<'a> Publisher<'a> {
         let topic = self.client.topic(&format!("command/{}", result.command));
         debug!("Publishing to {}: {}", topic, payload);
 
-        self.client.publish_retained(&topic, &payload).await
+        match timeout(PUBLISH_TIMEOUT, self.client.publish_retained(&topic, &payload)).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    "Publish timeout for {} after {}s - MQTT client may be stalled",
+                    topic,
+                    PUBLISH_TIMEOUT.as_secs()
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Publish multiple command results
@@ -92,5 +111,24 @@ mod tests {
         assert_eq!(format_number(48.1), "48.1");
         assert_eq!(format_number(3.14159), "3.14159");
         assert_eq!(format_number(0.5), "0.5");
+    }
+
+    #[test]
+    fn test_publish_timeout_is_5_seconds() {
+        assert_eq!(PUBLISH_TIMEOUT, Duration::from_secs(5));
+    }
+
+    /// Verify that `tokio::time::timeout` with `PUBLISH_TIMEOUT` fires
+    /// instead of blocking forever when the inner future never resolves.
+    /// This simulates the scenario where `publish_retained` blocks because
+    /// rumqttc's internal channel is full during a broker outage.
+    #[tokio::test]
+    async fn test_publish_timeout_fires_on_stalled_future() {
+        tokio::time::pause();
+
+        let stalled = std::future::pending::<Result<(), MqttError>>();
+        let result = timeout(PUBLISH_TIMEOUT, stalled).await;
+
+        assert!(result.is_err(), "timeout should fire on a stalled future");
     }
 }

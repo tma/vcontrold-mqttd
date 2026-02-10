@@ -10,6 +10,7 @@ use rustls::ClientConfig;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -269,6 +270,7 @@ pub async fn run_event_loop(
     client: AsyncClient,
     subscribe_topics: Vec<String>,
     message_tx: Option<mpsc::Sender<IncomingMessage>>,
+    mqtt_connected: Arc<AtomicBool>,
 ) {
     loop {
         match eventloop.poll().await {
@@ -289,6 +291,7 @@ pub async fn run_event_loop(
                         }
                         rumqttc::v5::Incoming::ConnAck(_) => {
                             info!("Connected to MQTT broker");
+                            mqtt_connected.store(true, Ordering::Relaxed);
 
                             // Re-subscribe to all topics on every (re)connection
                             for topic in &subscribe_topics {
@@ -306,6 +309,7 @@ pub async fn run_event_loop(
                         }
                         rumqttc::v5::Incoming::Disconnect(_) => {
                             warn!("Disconnected from MQTT broker");
+                            mqtt_connected.store(false, Ordering::Relaxed);
                         }
                         _ => {}
                     }
@@ -313,6 +317,7 @@ pub async fn run_event_loop(
             }
             Err(e) => {
                 error!("MQTT event loop error: {}", e);
+                mqtt_connected.store(false, Ordering::Relaxed);
                 // Wait before retrying
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }

@@ -2,6 +2,7 @@
 //!
 //! Handles command batching and periodic execution.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
@@ -66,6 +67,7 @@ pub async fn run_polling_loop(
     config: &Config,
     vcontrold: Arc<VcontroldClient>,
     mqtt_client: Arc<MqttClient>,
+    mqtt_connected: Arc<AtomicBool>,
 ) {
     if config.commands.is_empty() {
         warn!("No commands configured for polling");
@@ -88,10 +90,31 @@ pub async fn run_polling_loop(
     }
 
     let mut poll_interval = interval(config.interval);
+    // Skip missed ticks instead of bursting them all at once. This prevents
+    // overwhelming the MQTT client after a stall (e.g. broker outage where
+    // publishes hit the timeout and the interval falls behind).
+    poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let publisher = Publisher::new(&mqtt_client);
+
+    let mut was_disconnected = false;
 
     loop {
         poll_interval.tick().await;
+
+        // Skip entire cycle when the MQTT broker is unreachable. This avoids
+        // unnecessary vcontrold/Optolink traffic and prevents filling the
+        // rumqttc internal channel (which would block the polling loop).
+        if !mqtt_connected.load(Ordering::Relaxed) {
+            if !was_disconnected {
+                warn!("MQTT broker disconnected, skipping polling cycles");
+                was_disconnected = true;
+            }
+            continue;
+        }
+        if was_disconnected {
+            info!("MQTT broker reconnected, resuming polling");
+            was_disconnected = false;
+        }
 
         debug!("Starting polling cycle");
 
@@ -182,5 +205,67 @@ mod tests {
         let batches = batch_commands(&commands, 5);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0], vec!["veryLongCommandName"]);
+    }
+
+    /// Verify that the polling interval uses Skip behavior: after a long stall
+    /// only one tick fires rather than a burst of all missed ticks.
+    ///
+    /// With the default `Burst` behavior, advancing time by 5x the interval
+    /// would yield 5 immediately-ready ticks. With `Skip`, only the next
+    /// natural tick fires, so we get exactly 1.
+    #[tokio::test]
+    async fn test_interval_skips_missed_ticks() {
+        use std::time::Duration;
+        use tokio::time::{interval, MissedTickBehavior};
+
+        tokio::time::pause();
+
+        let period = Duration::from_secs(10);
+        let mut ivl = interval(period);
+        ivl.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        // First tick fires immediately (interval semantics)
+        ivl.tick().await;
+
+        // Simulate a stall: advance time by 5 periods without ticking
+        tokio::time::advance(period * 5).await;
+
+        // After the stall, exactly one tick should be ready (Skip discards
+        // missed ticks and resets to the next future deadline).
+        ivl.tick().await;
+
+        // The next tick should NOT be immediately available — it should
+        // require waiting another full period.
+        let next = tokio::time::timeout(period / 2, ivl.tick()).await;
+        assert!(
+            next.is_err(),
+            "no burst tick should be available; Skip must discard missed ticks"
+        );
+    }
+
+    #[test]
+    fn test_mqtt_connected_flag_state_transitions() {
+        // Verify the AtomicBool flag behaves correctly across the
+        // state transitions that run_event_loop and run_polling_loop rely on.
+        let connected = Arc::new(AtomicBool::new(false));
+
+        // Initial state: disconnected (same as main.rs)
+        assert!(!connected.load(Ordering::Relaxed));
+
+        // Simulate ConnAck in event loop
+        connected.store(true, Ordering::Relaxed);
+        assert!(connected.load(Ordering::Relaxed));
+
+        // Simulate Disconnect
+        connected.store(false, Ordering::Relaxed);
+        assert!(!connected.load(Ordering::Relaxed));
+
+        // Simulate reconnect
+        connected.store(true, Ordering::Relaxed);
+        assert!(connected.load(Ordering::Relaxed));
+
+        // Simulate event loop error
+        connected.store(false, Ordering::Relaxed);
+        assert!(!connected.load(Ordering::Relaxed));
     }
 }

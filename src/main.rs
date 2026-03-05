@@ -8,12 +8,13 @@
 
 mod config;
 mod error;
+mod health;
 mod mqtt;
 mod polling;
 mod process;
 mod vcontrold;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -21,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::health::{run_health_server, HealthState};
 use crate::mqtt::{run_event_loop, run_subscriber, MqttClient, Subscriber};
 use crate::polling::run_polling_loop;
 use crate::process::VcontroldProcess;
@@ -28,6 +30,16 @@ use crate::vcontrold::VcontroldClient;
 
 #[tokio::main]
 async fn main() {
+    // Handle --healthcheck before anything else (used by Docker HEALTHCHECK CMD)
+    if std::env::args().any(|a| a == "--healthcheck") {
+        let port: u16 = std::env::var("HEALTHCHECK_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8080);
+        let ok = health::check_health(port);
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     // Initialize logging
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if std::env::var("DEBUG")
@@ -96,6 +108,17 @@ async fn run() -> Result<()> {
     // Written by run_event_loop, read by run_polling_loop.
     let mqtt_connected = Arc::new(AtomicBool::new(false));
 
+    // Health state: tracks all components for the health endpoint
+    let vcontrold_running = Arc::new(AtomicBool::new(true));
+    let health_state = Arc::new(HealthState {
+        vcontrold_running: Arc::clone(&vcontrold_running),
+        vcontrold_connected: vcontrold_client.connected_flag(),
+        mqtt_connected: Arc::clone(&mqtt_connected),
+    });
+
+    // Spawn health check HTTP server
+    let health_handle = tokio::spawn(run_health_server(config.healthcheck_port, health_state));
+
     // Channel for subscriber messages (if enabled)
     let (message_tx, message_rx) = if config.mqtt_subscribe {
         let (tx, rx) = mpsc::channel(100);
@@ -154,6 +177,7 @@ async fn run() -> Result<()> {
     // Wait for any task to complete or shutdown signal
     let exit_error = tokio::select! {
         result = vcontrold_process.wait() => {
+            vcontrold_running.store(false, Ordering::Relaxed);
             match result {
                 Ok(code) => {
                     error!("vcontrold exited with code: {:?}", code);
@@ -189,6 +213,10 @@ async fn run() -> Result<()> {
             }
         } => {
             error!("Subscriber exited unexpectedly");
+            None
+        }
+        _ = health_handle => {
+            error!("Health server exited unexpectedly");
             None
         }
         _ = shutdown_signal() => {

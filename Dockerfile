@@ -54,4 +54,9 @@ USER vcontrold
 
 VOLUME ["/config"]
 
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD ["/usr/local/bin/vcontrold-mqttd", "--healthcheck"]
+
 ENTRYPOINT ["/usr/local/bin/vcontrold-mqttd"]

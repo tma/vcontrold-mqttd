@@ -24,6 +24,8 @@ pub struct Config {
     pub commands: Vec<String>,
     /// Enable verbose logging
     pub debug: bool,
+    /// TCP port for the health check HTTP endpoint
+    pub healthcheck_port: u16,
 }
 
 /// MQTT-specific configuration
@@ -127,6 +129,7 @@ impl Config {
             interval: Duration::from_secs(parse_u64("INTERVAL", 60)?),
             commands,
             debug: parse_bool("DEBUG", false),
+            healthcheck_port: parse_u16("HEALTHCHECK_PORT", 8080)?,
         })
     }
 

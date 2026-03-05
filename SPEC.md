@@ -26,6 +26,7 @@ A containerized wrapper around **vcontrold** (Viessmann heating controller inter
 | Environment variable parsing | Done |
 | Debug logging | Done |
 | Unit tests | Done |
+| Health check endpoint | Done |
 | Production Dockerfile | Done |
 | Devcontainer | Done |
 
@@ -60,6 +61,7 @@ A containerized wrapper around **vcontrold** (Viessmann heating controller inter
 | `INTERVAL` | `60` | Seconds between polling cycles |
 | `COMMANDS` | `""` | Comma-separated list of command names to poll |
 | `DEBUG` | `false` | Enable verbose logging |
+| `HEALTHCHECK_PORT` | `8080` | TCP port for the health check HTTP endpoint |
 
 ## vcontrold Daemon
 
@@ -317,10 +319,57 @@ vcontrold-mqttd (PID 1, Rust binary)
 ├── Task: vcontrold process monitor
 ├── Task: MQTT event loop
 ├── Task: Polling loop (if COMMANDS set)
-└── Task: Subscriber (if MQTT_SUBSCRIBE=true)
+├── Task: Subscriber (if MQTT_SUBSCRIBE=true)
+└── Task: Health check HTTP server
 ```
 
 All tasks run concurrently via tokio. If any critical task fails, the container exits.
+
+## Health Check
+
+An HTTP health endpoint runs on `HEALTHCHECK_PORT` (default `8080`) and reports
+the status of all critical components.
+
+### Endpoint
+
+**URL**: `http://0.0.0.0:<HEALTHCHECK_PORT>/health` (any path is accepted)
+
+### Response
+
+| Status | Condition |
+|--------|-----------|
+| `200 OK` | All components healthy |
+| `503 Service Unavailable` | One or more components unhealthy |
+
+**Body** (JSON):
+```json
+{
+  "healthy": true,
+  "vcontrold_process": true,
+  "vcontrold_connection": true,
+  "mqtt_connected": true
+}
+```
+
+### Checked Components
+
+| Component | What is checked |
+|-----------|----------------|
+| `vcontrold_process` | vcontrold daemon is still running |
+| `vcontrold_connection` | Persistent TCP connection to vcontrold is alive |
+| `mqtt_connected` | MQTT broker connection is active |
+
+### Docker HEALTHCHECK
+
+The Dockerfile includes:
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD ["/usr/local/bin/vcontrold-mqttd", "--healthcheck"]
+```
+
+The `--healthcheck` flag makes the binary act as a lightweight probe client:
+it connects to the health endpoint on `127.0.0.1:<HEALTHCHECK_PORT>`, checks
+for a `200` response, and exits `0` (healthy) or `1` (unhealthy).
 
 ## Container Requirements
 

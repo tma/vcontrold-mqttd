@@ -12,6 +12,7 @@ A Rust-based MQTT bridge for [vcontrold](https://github.com/openv/vcontrold) (Vi
 - **Request/response bridge** for ad-hoc commands via MQTT
 - **Command batching** to respect protocol limits
 - **Multi-architecture** Docker images (amd64, arm64)
+- **Built-in health check** endpoint for Docker/orchestrator health monitoring
 
 ## Quick Start
 
@@ -78,6 +79,7 @@ docker compose up -d
 | `MAX_LENGTH` | `512` | Max batch length in characters |
 | `USB_DEVICE` | `/dev/vitocal` | Serial device path inside container |
 | `DEBUG` | `false` | Enable debug logging |
+| `HEALTHCHECK_PORT` | `8080` | Health check HTTP endpoint port |
 
 ### Required Files
 
@@ -146,6 +148,25 @@ Response format (JSON):
 ```json
 {"getTempA":21.5,"getTempWW":48.1}
 ```
+
+## Health Check
+
+The container includes a built-in health check that verifies all critical components:
+- **vcontrold process** is running
+- **vcontrold TCP connection** is alive
+- **MQTT broker** is connected
+
+The health endpoint listens on port `8080` (configurable via `HEALTHCHECK_PORT`) and returns:
+- `200 OK` with JSON body when all components are healthy
+- `503 Service Unavailable` when any component is down
+
+```bash
+# Manual check
+curl http://localhost:8080/health
+# {"healthy":true,"vcontrold_process":true,"vcontrold_connection":true,"mqtt_connected":true}
+```
+
+Docker's `HEALTHCHECK` is preconfigured in the image using `--healthcheck` flag, so `docker ps` will show container health status automatically.
 
 ## Development
 

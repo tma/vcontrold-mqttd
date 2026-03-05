@@ -2,6 +2,8 @@
 //!
 //! Manages a persistent TCP connection to vcontrold, with automatic reconnection.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -30,6 +32,9 @@ pub struct VcontroldClient {
     host: String,
     port: u16,
     connection: Mutex<Option<Connection>>,
+    /// Tracks whether the persistent TCP connection is alive.
+    /// Updated on connect/disconnect; exposed for health checks.
+    connected: Arc<AtomicBool>,
 }
 
 struct Connection {
@@ -44,6 +49,7 @@ impl VcontroldClient {
             host: host.into(),
             port,
             connection: Mutex::new(None),
+            connected: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -59,6 +65,7 @@ impl VcontroldClient {
             info!("Connecting to vcontrold at {}:{}", self.host, self.port);
             let connection = self.connect_internal().await?;
             *conn_guard = Some(connection);
+            self.connected.store(true, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -125,6 +132,7 @@ impl VcontroldClient {
                 // Stream is dead, nothing to send quit to
                 drop(conn_guard);
                 *self.connection.lock().await = None;
+                self.connected.store(false, Ordering::Relaxed);
                 return Err(VcontroldError::ConnectionLost);
             }
             Ok(Err(e)) => {
@@ -133,6 +141,7 @@ impl VcontroldClient {
                 let _ = conn.writer.flush().await;
                 drop(conn_guard);
                 *self.connection.lock().await = None;
+                self.connected.store(false, Ordering::Relaxed);
                 return Err(e);
             }
             Err(_) => {
@@ -143,6 +152,7 @@ impl VcontroldClient {
                 let _ = conn.writer.flush().await;
                 drop(conn_guard);
                 *self.connection.lock().await = None;
+                self.connected.store(false, Ordering::Relaxed);
                 return Err(VcontroldError::Timeout);
             }
         }
@@ -170,6 +180,7 @@ impl VcontroldClient {
             let _ = conn.writer.write_all(format_quit().as_bytes()).await;
             let _ = conn.writer.flush().await;
         }
+        self.connected.store(false, Ordering::Relaxed);
     }
 
     /// Check if vcontrold is responding (for readiness probes)
@@ -190,6 +201,11 @@ impl VcontroldClient {
         }
     }
 
+    /// Get a shared reference to the connection-alive flag (for health checks)
+    pub fn connected_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.connected)
+    }
+
     /// Mark connection as lost (called when we detect issues)
     #[allow(dead_code)]
     pub async fn mark_disconnected(&self) {
@@ -197,6 +213,7 @@ impl VcontroldClient {
         if conn_guard.take().is_some() {
             warn!("Connection marked as disconnected");
         }
+        self.connected.store(false, Ordering::Relaxed);
     }
 }
 

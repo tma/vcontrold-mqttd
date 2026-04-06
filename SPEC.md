@@ -204,6 +204,8 @@ The parser extracts:
    - Execute each command via TCP connection
    - Build JSON response
    - Publish response to `${MQTT_TOPIC}/response`
+   - If the internal subscriber queue is saturated, drop new request messages
+     instead of blocking the MQTT event loop
 4. On disconnect: automatic reconnection via rumqttc
 
 ## Error Handling

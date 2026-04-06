@@ -7,15 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::error::VcontroldError;
 
 use super::protocol::{
-    extract_response, format_command, format_quit, parse_response, validate_command,
-    CommandResult, PROMPT,
+    extract_response, format_command, format_quit, is_fatal_error_response, parse_response,
+    validate_command, CommandResult, PROMPT,
 };
 
 /// Default vcontrold port
@@ -102,69 +102,97 @@ impl VcontroldClient {
 
     /// Execute a single command and return the result
     pub async fn execute(&self, command: &str) -> Result<CommandResult, VcontroldError> {
+        enum ExecuteOutcome {
+            Success(CommandResult),
+            FatalResponse(CommandResult),
+            Error {
+                error: VcontroldError,
+                send_quit: bool,
+            },
+        }
+
         validate_command(command)?;
         self.ensure_connected().await?;
 
         let mut conn_guard = self.connection.lock().await;
-        let conn = conn_guard
-            .as_mut()
-            .ok_or(VcontroldError::ConnectionLost)?;
+        let outcome = {
+            let conn = conn_guard.as_mut().ok_or(VcontroldError::ConnectionLost)?;
 
-        // Send command
-        let cmd_str = format_command(command);
-        debug!("Sending command: {}", command);
-        conn.writer
-            .write_all(cmd_str.as_bytes())
-            .await
-            .map_err(|e| {
+            // Send command
+            let cmd_str = format_command(command);
+            debug!("Sending command: {}", command);
+            if let Err(e) = conn.writer.write_all(cmd_str.as_bytes()).await {
                 error!("Failed to send command: {}", e);
-                VcontroldError::Io(e)
-            })?;
-        conn.writer.flush().await.map_err(VcontroldError::Io)?;
+                ExecuteOutcome::Error {
+                    error: VcontroldError::Io(e),
+                    send_quit: false,
+                }
+            } else if let Err(e) = conn.writer.flush().await {
+                error!("Failed to flush command: {}", e);
+                ExecuteOutcome::Error {
+                    error: VcontroldError::Io(e),
+                    send_quit: false,
+                }
+            } else {
+                // Read response until prompt
+                let mut buffer = String::new();
+                let read_result = timeout(
+                    READ_TIMEOUT,
+                    read_until_prompt(&mut conn.reader, &mut buffer),
+                )
+                .await;
 
-        // Read response until prompt
-        let mut buffer = String::new();
-        let read_result = timeout(READ_TIMEOUT, read_until_prompt(&mut conn.reader, &mut buffer)).await;
+                match read_result {
+                    Ok(Ok(())) => {
+                        let response = extract_response(&buffer).unwrap_or("");
+                        debug!("Received response: {}", response);
 
-        match read_result {
-            Ok(Ok(())) => {}
-            Ok(Err(VcontroldError::ConnectionLost)) => {
-                // Stream is dead, nothing to send quit to
-                drop(conn_guard);
-                *self.connection.lock().await = None;
-                self.connected.store(false, Ordering::Relaxed);
-                return Err(VcontroldError::ConnectionLost);
+                        let result = parse_response(command, response);
+                        if result.error.as_deref().is_some_and(is_fatal_error_response) {
+                            ExecuteOutcome::FatalResponse(result)
+                        } else {
+                            ExecuteOutcome::Success(result)
+                        }
+                    }
+                    Ok(Err(VcontroldError::ConnectionLost)) => ExecuteOutcome::Error {
+                        error: VcontroldError::ConnectionLost,
+                        send_quit: false,
+                    },
+                    Ok(Err(e)) => ExecuteOutcome::Error {
+                        error: e,
+                        send_quit: true,
+                    },
+                    Err(_) => ExecuteOutcome::Error {
+                        error: VcontroldError::Timeout,
+                        send_quit: true,
+                    },
+                }
             }
-            Ok(Err(e)) => {
-                // Try to send quit so vcontrold doesn't see a broken pipe
-                let _ = conn.writer.write_all(format_quit().as_bytes()).await;
-                let _ = conn.writer.flush().await;
-                drop(conn_guard);
-                *self.connection.lock().await = None;
-                self.connected.store(false, Ordering::Relaxed);
-                return Err(e);
+        };
+
+        match outcome {
+            ExecuteOutcome::Success(result) => Ok(result),
+            ExecuteOutcome::FatalResponse(result) => {
+                warn!(
+                    "Fatal vcontrold session error for {} - resetting connection before the next command",
+                    command
+                );
+                invalidate_locked_connection(&mut conn_guard, self.connected.as_ref(), true).await;
+                Ok(result)
             }
-            Err(_) => {
-                // Clear stale connection: the stream may contain partial
-                // data from the timed-out response, so reusing it would
-                // corrupt subsequent commands. Best-effort quit.
-                let _ = conn.writer.write_all(format_quit().as_bytes()).await;
-                let _ = conn.writer.flush().await;
-                drop(conn_guard);
-                *self.connection.lock().await = None;
-                self.connected.store(false, Ordering::Relaxed);
-                return Err(VcontroldError::Timeout);
+            ExecuteOutcome::Error { error, send_quit } => {
+                invalidate_locked_connection(&mut conn_guard, self.connected.as_ref(), send_quit)
+                    .await;
+                Err(error)
             }
         }
-
-        // Parse response
-        let response = extract_response(&buffer).unwrap_or("");
-        debug!("Received response: {}", response);
-        Ok(parse_response(command, response))
     }
 
     /// Execute multiple commands and return all results
-    pub async fn execute_batch(&self, commands: &[String]) -> Vec<Result<CommandResult, VcontroldError>> {
+    pub async fn execute_batch(
+        &self,
+        commands: &[String],
+    ) -> Vec<Result<CommandResult, VcontroldError>> {
         let mut results = Vec::with_capacity(commands.len());
         for cmd in commands {
             results.push(self.execute(cmd).await);
@@ -217,6 +245,21 @@ impl VcontroldClient {
     }
 }
 
+async fn invalidate_locked_connection(
+    conn_guard: &mut MutexGuard<'_, Option<Connection>>,
+    connected: &AtomicBool,
+    send_quit: bool,
+) {
+    if let Some(mut conn) = conn_guard.take() {
+        if send_quit {
+            let _ = conn.writer.write_all(format_quit().as_bytes()).await;
+            let _ = conn.writer.flush().await;
+        }
+    }
+
+    connected.store(false, Ordering::Relaxed);
+}
+
 /// Read from reader until the prompt is found
 ///
 /// Accumulates raw bytes and checks for the prompt in the byte stream.
@@ -248,5 +291,134 @@ async fn read_until_prompt<R: AsyncReadExt + Unpin>(
 impl Drop for VcontroldClient {
     fn drop(&mut self) {
         // Note: async disconnect not possible in drop, connection will just close
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vcontrold::Value;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn write_prompt(stream: &mut TcpStream) {
+        stream.write_all(PROMPT.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_keeps_connection_after_non_fatal_error_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            write_prompt(&mut stream).await;
+
+            let mut reader = BufReader::new(stream);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "badCommand\n");
+
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(b"ERR: command unknown\nvctrld>")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            let mut reader = BufReader::new(stream);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "getTempWWsoll\n");
+
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(b"48.1 Grad Celsius\nvctrld>")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            let mut reader = BufReader::new(stream);
+            let mut quit = String::new();
+            reader.read_line(&mut quit).await.unwrap();
+            assert_eq!(quit, "quit\n");
+        });
+
+        let client = VcontroldClient::new("127.0.0.1", port);
+
+        let first = client.execute("badCommand").await.unwrap();
+        assert_eq!(first.error.as_deref(), Some("ERR: command unknown"));
+        assert!(client.connected_flag().load(Ordering::Relaxed));
+
+        let second = client.execute("getTempWWsoll").await.unwrap();
+        assert!(matches!(second.value, Value::Number(n) if (n - 48.1).abs() < 0.001));
+        assert!(second.error.is_none());
+        assert!(client.connected_flag().load(Ordering::Relaxed));
+
+        client.disconnect().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_resets_connection_after_fatal_error_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await.unwrap();
+            write_prompt(&mut first_stream).await;
+
+            let mut first_reader = BufReader::new(first_stream);
+            let mut command = String::new();
+            first_reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "getTempA\n");
+
+            let mut first_stream = first_reader.into_inner();
+            first_stream
+                .write_all(
+                    b"ERR: >FRAMER: Error 0x05 != 0x06 (P300_INIT_OK)\nError in send, terminating\nError executing getTempA\nvctrld>",
+                )
+                .await
+                .unwrap();
+            first_stream.flush().await.unwrap();
+
+            let mut quit = String::new();
+            let mut first_reader = BufReader::new(first_stream);
+            first_reader.read_line(&mut quit).await.unwrap();
+            assert_eq!(quit, "quit\n");
+
+            let (mut second_stream, _) = listener.accept().await.unwrap();
+            write_prompt(&mut second_stream).await;
+
+            let mut second_reader = BufReader::new(second_stream);
+            let mut command = String::new();
+            second_reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "getTempWWsoll\n");
+
+            let mut second_stream = second_reader.into_inner();
+            second_stream
+                .write_all(b"48.1 Grad Celsius\nvctrld>")
+                .await
+                .unwrap();
+            second_stream.flush().await.unwrap();
+        });
+
+        let client = VcontroldClient::new("127.0.0.1", port);
+
+        let first = client.execute("getTempA").await.unwrap();
+        assert!(
+            first.error.as_deref().is_some_and(is_fatal_error_response),
+            "first response should preserve the fatal vcontrold error text"
+        );
+        assert!(!client.connected_flag().load(Ordering::Relaxed));
+
+        let second = client.execute("getTempWWsoll").await.unwrap();
+        assert!(matches!(second.value, Value::Number(n) if (n - 48.1).abs() < 0.001));
+        assert!(second.error.is_none());
+        assert!(client.connected_flag().load(Ordering::Relaxed));
+
+        client.disconnect().await;
+        server.await.unwrap();
     }
 }

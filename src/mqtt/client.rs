@@ -103,16 +103,19 @@ fn build_tls_transport(host: &str, config: &TlsConfig) -> Result<Transport, Mqtt
     if let Some(ca_file) = &config.ca_file {
         let certs = load_certs(ca_file)?;
         for cert in certs {
-            root_cert_store
-                .add(cert)
-                .map_err(|e| MqttError::ConnectionFailed(format!("Failed to add CA cert: {}", e)))?;
+            root_cert_store.add(cert).map_err(|e| {
+                MqttError::ConnectionFailed(format!("Failed to add CA cert: {}", e))
+            })?;
         }
     } else if let Some(ca_path) = &config.ca_path {
         // Load all .crt and .pem files from directory
         if let Ok(entries) = std::fs::read_dir(ca_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "crt" || ext == "pem") {
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext == "crt" || ext == "pem")
+                {
                     if let Ok(certs) = load_certs(&path) {
                         for cert in certs {
                             let _ = root_cert_store.add(cert);
@@ -129,19 +132,18 @@ fn build_tls_transport(host: &str, config: &TlsConfig) -> Result<Transport, Mqtt
     // Build client config
     let builder = ClientConfig::builder().with_root_certificates(root_cert_store);
 
-    let tls_config = if let (Some(cert_file), Some(key_file)) =
-        (&config.cert_file, &config.key_file)
-    {
-        // Client certificate authentication
-        let certs = load_certs(cert_file)?;
-        let key = load_private_key(key_file)?;
-        builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| MqttError::ConnectionFailed(format!("Failed to set client cert: {}", e)))?
-    } else {
-        // No client certificate
-        builder.with_no_client_auth()
-    };
+    let tls_config =
+        if let (Some(cert_file), Some(key_file)) = (&config.cert_file, &config.key_file) {
+            // Client certificate authentication
+            let certs = load_certs(cert_file)?;
+            let key = load_private_key(key_file)?;
+            builder.with_client_auth_cert(certs, key).map_err(|e| {
+                MqttError::ConnectionFailed(format!("Failed to set client cert: {}", e))
+            })?
+        } else {
+            // No client certificate
+            builder.with_no_client_auth()
+        };
 
     // Create rustls ClientConfig with dangerous verifier if insecure mode
     let tls_config = if config.insecure {
@@ -162,7 +164,9 @@ fn build_tls_transport(host: &str, config: &TlsConfig) -> Result<Transport, Mqtt
         .try_into()
         .map_err(|_| MqttError::ConnectionFailed(format!("Invalid server name: {}", host)))?;
 
-    Ok(Transport::tls_with_config(rumqttc::TlsConfiguration::Rustls(Arc::new(tls_config))))
+    Ok(Transport::tls_with_config(
+        rumqttc::TlsConfiguration::Rustls(Arc::new(tls_config)),
+    ))
 }
 
 /// Load certificates from a PEM file
@@ -260,11 +264,58 @@ impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionQueueStatus {
+    Complete,
+    Pending,
+}
+
+fn queue_pending_subscriptions(
+    client: &AsyncClient,
+    subscribe_topics: &[String],
+    next_subscription: &mut usize,
+) -> SubscriptionQueueStatus {
+    while *next_subscription < subscribe_topics.len() {
+        let topic = &subscribe_topics[*next_subscription];
+        if client.try_subscribe(topic, QoS::AtLeastOnce).is_err() {
+            return SubscriptionQueueStatus::Pending;
+        }
+
+        info!("Subscribing to {}", topic);
+        *next_subscription += 1;
+    }
+
+    SubscriptionQueueStatus::Complete
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardMessageStatus {
+    Sent,
+    DroppedFull,
+    DroppedClosed,
+    Ignored,
+}
+
+fn forward_incoming_message(
+    message_tx: Option<&mpsc::Sender<IncomingMessage>>,
+    msg: IncomingMessage,
+) -> ForwardMessageStatus {
+    let Some(tx) = message_tx else {
+        return ForwardMessageStatus::Ignored;
+    };
+
+    match tx.try_send(msg) {
+        Ok(()) => ForwardMessageStatus::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => ForwardMessageStatus::DroppedFull,
+        Err(mpsc::error::TrySendError::Closed(_)) => ForwardMessageStatus::DroppedClosed,
+    }
+}
+
 /// Run the MQTT event loop and forward incoming messages
 ///
-/// Re-subscribes to all topics on every ConnAck (reconnection), since
-/// rumqttc uses `clean_start = true` by default and the broker discards
-/// session state (including subscriptions) when the client reconnects.
+/// When the broker does not resume a previous session on ConnAck, subscriptions
+/// are re-queued with `try_subscribe` and retried across loop iterations so the
+/// rumqtt event loop never blocks waiting for channel capacity.
 pub async fn run_event_loop(
     mut eventloop: EventLoop,
     client: AsyncClient,
@@ -272,7 +323,27 @@ pub async fn run_event_loop(
     message_tx: Option<mpsc::Sender<IncomingMessage>>,
     mqtt_connected: Arc<AtomicBool>,
 ) {
+    let mut pending_subscription_index: Option<usize> = None;
+    let mut subscription_restore_stalled = false;
+
     loop {
+        if let Some(next_subscription) = pending_subscription_index.as_mut() {
+            match queue_pending_subscriptions(&client, &subscribe_topics, next_subscription) {
+                SubscriptionQueueStatus::Complete => {
+                    pending_subscription_index = None;
+                    subscription_restore_stalled = false;
+                }
+                SubscriptionQueueStatus::Pending => {
+                    if !subscription_restore_stalled {
+                        warn!(
+                            "Could not queue all MQTT subscriptions yet; will retry without blocking the event loop"
+                        );
+                        subscription_restore_stalled = true;
+                    }
+                }
+            }
+        }
+
         match eventloop.poll().await {
             Ok(event) => {
                 if let Event::Incoming(incoming) = event {
@@ -282,22 +353,38 @@ pub async fn run_event_loop(
                             let payload = String::from_utf8_lossy(&publish.payload).to_string();
                             debug!("Received message on {}: {}", topic, payload);
 
-                            if let Some(tx) = &message_tx {
-                                let msg = IncomingMessage { topic, payload };
-                                if tx.send(msg).await.is_err() {
+                            let msg = IncomingMessage {
+                                topic: topic.clone(),
+                                payload,
+                            };
+                            match forward_incoming_message(message_tx.as_ref(), msg) {
+                                ForwardMessageStatus::Sent | ForwardMessageStatus::Ignored => {}
+                                ForwardMessageStatus::DroppedFull => {
+                                    warn!(
+                                        "Dropping incoming message on {} because the subscriber queue is full",
+                                        topic
+                                    );
+                                }
+                                ForwardMessageStatus::DroppedClosed => {
                                     warn!("Failed to forward incoming message - receiver dropped");
                                 }
                             }
                         }
-                        rumqttc::v5::Incoming::ConnAck(_) => {
+                        rumqttc::v5::Incoming::ConnAck(connack) => {
                             info!("Connected to MQTT broker");
                             mqtt_connected.store(true, Ordering::Relaxed);
+                            subscription_restore_stalled = false;
 
-                            // Re-subscribe to all topics on every (re)connection
-                            for topic in &subscribe_topics {
-                                info!("Subscribing to {}", topic);
-                                if let Err(e) = client.subscribe(topic, QoS::AtLeastOnce).await {
-                                    error!("Failed to subscribe to {}: {}", topic, e);
+                            if !subscribe_topics.is_empty() {
+                                if connack.session_present {
+                                    debug!("MQTT session resumed; keeping existing subscriptions");
+                                    pending_subscription_index = None;
+                                } else {
+                                    debug!(
+                                        "Scheduling restore of {} MQTT subscription(s)",
+                                        subscribe_topics.len()
+                                    );
+                                    pending_subscription_index = Some(0);
                                 }
                             }
                         }
@@ -310,6 +397,8 @@ pub async fn run_event_loop(
                         rumqttc::v5::Incoming::Disconnect(_) => {
                             warn!("Disconnected from MQTT broker");
                             mqtt_connected.store(false, Ordering::Relaxed);
+                            pending_subscription_index = None;
+                            subscription_restore_stalled = false;
                         }
                         _ => {}
                     }
@@ -318,9 +407,75 @@ pub async fn run_event_loop(
             Err(e) => {
                 error!("MQTT event loop error: {}", e);
                 mqtt_connected.store(false, Ordering::Relaxed);
+                pending_subscription_index = None;
+                subscription_restore_stalled = false;
                 // Wait before retrying
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_pending_subscriptions_completes_when_capacity_is_available() {
+        let options = MqttOptions::new("test-client", "localhost", 1883);
+        let (client, _eventloop) = AsyncClient::new(options, 2);
+        let topics = vec![
+            "heating/request".to_string(),
+            "heating/response".to_string(),
+        ];
+        let mut next_subscription = 0;
+
+        let status = queue_pending_subscriptions(&client, &topics, &mut next_subscription);
+
+        assert_eq!(status, SubscriptionQueueStatus::Complete);
+        assert_eq!(next_subscription, topics.len());
+    }
+
+    #[test]
+    fn queue_pending_subscriptions_stays_pending_when_request_channel_is_full() {
+        let options = MqttOptions::new("test-client", "localhost", 1883);
+        let (client, _eventloop) = AsyncClient::new(options, 1);
+        let topics = vec!["heating/request".to_string()];
+        let mut next_subscription = 0;
+
+        client
+            .try_publish("heating/command/getTempA", QoS::AtLeastOnce, false, "21.5")
+            .expect("request channel should accept the first queued publish");
+
+        let status = queue_pending_subscriptions(&client, &topics, &mut next_subscription);
+
+        assert_eq!(status, SubscriptionQueueStatus::Pending);
+        assert_eq!(next_subscription, 0);
+    }
+
+    #[tokio::test]
+    async fn forward_incoming_message_drops_when_subscriber_queue_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let first = IncomingMessage {
+            topic: "heating/request".to_string(),
+            payload: "first".to_string(),
+        };
+        let second = IncomingMessage {
+            topic: "heating/request".to_string(),
+            payload: "second".to_string(),
+        };
+
+        tx.send(first).await.unwrap();
+
+        let status = forward_incoming_message(Some(&tx), second);
+
+        assert_eq!(status, ForwardMessageStatus::DroppedFull);
+
+        let queued = rx.recv().await.expect("first message should stay queued");
+        assert_eq!(queued.payload, "first");
+        assert!(
+            rx.try_recv().is_err(),
+            "full queue must not accept second message"
+        );
     }
 }

@@ -149,6 +149,12 @@ Response format (JSON):
 {"getTempA":21.5,"getTempWW":48.1}
 ```
 
+Notes:
+- Request/response handling is best-effort under overload.
+- If the internal subscriber queue is full, new request messages may be dropped
+  so the MQTT event loop can stay responsive and reconnect cleanly.
+- Clients should retry a request if no response arrives.
+
 ## Health Check
 
 The container includes a built-in health check that verifies all critical components:

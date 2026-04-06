@@ -111,6 +111,19 @@ pub fn is_error_response(response: &str) -> bool {
     response.starts_with(ERR_PREFIX)
 }
 
+/// Check if an error response indicates that the current vcontrold session
+/// is no longer safe to reuse.
+///
+/// These patterns come from real-world logs where vcontrold reports a framer
+/// initialization/send failure (`>FRAMER ...`, `Error in send, terminating`).
+/// After this kind of error, the TCP session should be dropped so the next
+/// command reconnects cleanly.
+pub fn is_fatal_error_response(response: &str) -> bool {
+    let response = response.trim();
+    response.starts_with(ERR_PREFIX)
+        && (response.contains(">FRAMER:") || response.contains("Error in send, terminating"))
+}
+
 /// Build JSON output matching vclient -j format
 ///
 /// Format: {"command1":value1,"command2":value2}
@@ -183,5 +196,16 @@ mod tests {
         let json = build_json_response(&results);
         assert!(json.contains("\"getTempA\":21.5"));
         assert!(json.contains("\"getTempB\":45"));
+    }
+
+    #[test]
+    fn test_is_fatal_error_response_for_framer_send_failure() {
+        let response = "ERR: >FRAMER: Error 0x05 != 0x06 (P300_INIT_OK)\nError in send, terminating\nError executing getTempA";
+        assert!(is_fatal_error_response(response));
+    }
+
+    #[test]
+    fn test_is_fatal_error_response_false_for_normal_command_error() {
+        assert!(!is_fatal_error_response("ERR: command unknown"));
     }
 }

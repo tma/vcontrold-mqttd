@@ -2,9 +2,8 @@
 //!
 //! Provides a simplified interface for MQTT v5 operations with TLS support.
 
-use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
-use rumqttc::Transport;
+use rumqttc::mqttbytes::QoS;
+use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, TlsConfiguration, Transport};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::ClientConfig;
 use std::fs::File;
@@ -35,12 +34,12 @@ pub struct MqttClient {
 impl MqttClient {
     /// Create a new MQTT client from configuration
     pub fn new(config: &MqttConfig, client_id: &str) -> Result<(Self, EventLoop), MqttError> {
-        let mut options = MqttOptions::new(client_id, &config.host, config.port);
-        options.set_keep_alive(Duration::from_secs(30));
+        let mut options = MqttOptions::new(client_id, (config.host.clone(), config.port));
+        options.set_keep_alive(30);
 
         // Set credentials if provided
         if let (Some(user), Some(pass)) = (&config.user, &config.password) {
-            options.set_credentials(user, pass);
+            options.set_credentials(user, pass.clone());
         }
 
         // Configure TLS if enabled
@@ -50,7 +49,7 @@ impl MqttClient {
             info!("MQTT TLS enabled");
         }
 
-        let (client, eventloop) = AsyncClient::new(options, 100);
+        let (client, eventloop) = AsyncClient::builder(options).capacity(100).build();
 
         Ok((
             Self {
@@ -164,9 +163,9 @@ fn build_tls_transport(host: &str, config: &TlsConfig) -> Result<Transport, Mqtt
         .try_into()
         .map_err(|_| MqttError::ConnectionFailed(format!("Invalid server name: {}", host)))?;
 
-    Ok(Transport::tls_with_config(
-        rumqttc::TlsConfiguration::Rustls(Arc::new(tls_config)),
-    ))
+    Ok(Transport::Tls(TlsConfiguration::Rustls(Arc::new(
+        tls_config,
+    ))))
 }
 
 /// Load certificates from a PEM file
@@ -348,7 +347,7 @@ pub async fn run_event_loop(
             Ok(event) => {
                 if let Event::Incoming(incoming) = event {
                     match incoming {
-                        rumqttc::v5::Incoming::Publish(publish) => {
+                        Packet::Publish(publish) => {
                             let topic = String::from_utf8_lossy(&publish.topic).to_string();
                             let payload = String::from_utf8_lossy(&publish.payload).to_string();
                             debug!("Received message on {}: {}", topic, payload);
@@ -370,7 +369,7 @@ pub async fn run_event_loop(
                                 }
                             }
                         }
-                        rumqttc::v5::Incoming::ConnAck(connack) => {
+                        Packet::ConnAck(connack) => {
                             info!("Connected to MQTT broker");
                             mqtt_connected.store(true, Ordering::Relaxed);
                             subscription_restore_stalled = false;
@@ -388,13 +387,13 @@ pub async fn run_event_loop(
                                 }
                             }
                         }
-                        rumqttc::v5::Incoming::SubAck(_) => {
+                        Packet::SubAck(_) => {
                             debug!("Subscription acknowledged");
                         }
-                        rumqttc::v5::Incoming::PubAck(_) => {
+                        Packet::PubAck(_) => {
                             // Normal acknowledgment, no action needed
                         }
-                        rumqttc::v5::Incoming::Disconnect(_) => {
+                        Packet::Disconnect(_) => {
                             warn!("Disconnected from MQTT broker");
                             mqtt_connected.store(false, Ordering::Relaxed);
                             pending_subscription_index = None;
@@ -422,8 +421,8 @@ mod tests {
 
     #[test]
     fn queue_pending_subscriptions_completes_when_capacity_is_available() {
-        let options = MqttOptions::new("test-client", "localhost", 1883);
-        let (client, _eventloop) = AsyncClient::new(options, 2);
+        let options = MqttOptions::new("test-client", ("localhost", 1883));
+        let (client, _eventloop) = AsyncClient::builder(options).capacity(2).build();
         let topics = vec![
             "heating/request".to_string(),
             "heating/response".to_string(),
@@ -438,14 +437,14 @@ mod tests {
 
     #[test]
     fn queue_pending_subscriptions_stays_pending_when_request_channel_is_full() {
-        let options = MqttOptions::new("test-client", "localhost", 1883);
-        let (client, _eventloop) = AsyncClient::new(options, 1);
+        let options = MqttOptions::new("test-client", ("localhost", 1883));
+        let (client, _eventloop) = AsyncClient::builder(options).capacity(1).build();
         let topics = vec!["heating/request".to_string()];
         let mut next_subscription = 0;
 
         client
-            .try_publish("heating/command/getTempA", QoS::AtLeastOnce, false, "21.5")
-            .expect("request channel should accept the first queued publish");
+            .try_subscribe("heating/existing", QoS::AtLeastOnce)
+            .expect("request channel should accept the first queued subscription");
 
         let status = queue_pending_subscriptions(&client, &topics, &mut next_subscription);
 

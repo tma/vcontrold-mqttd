@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full", "process", "signal"] }
-rumqttc = { version = "0.25", features = ["use-rustls"] }
+rumqttc = { package = "rumqttc-next", version = "0.33", default-features = false, features = ["use-rustls-aws-lc"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 webpki-roots = "1"
